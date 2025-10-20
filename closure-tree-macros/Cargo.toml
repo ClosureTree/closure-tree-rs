@@ -1,0 +1,17 @@
+[package]
+name = "closure-tree-macros"
+version = "0.0.1"
+edition = "2021"
+description = "Procedural macros for closure-tree."
+readme = "../README.md"
+license = "MIT"
+repository = "https://github.com/ClosureTree/closure-tree-rs"
+homepage = "https://github.com/ClosureTree/closure-tree-rs"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote = "1"
+syn = { version = "2", features = ["full"] }

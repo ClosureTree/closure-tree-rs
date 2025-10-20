@@ -1,0 +1,36 @@
+[package]
+name = "closure-tree"
+version = "0.0.1"
+edition = "2021"
+description = "Closure Tree support for SeaORM (PostgreSQL)."
+readme = "README.md"
+license = "MIT"
+repository = "https://github.com/ClosureTree/closure-tree-rs"
+homepage = "https://github.com/ClosureTree/closure-tree-rs"
+keywords = ["sea-orm", "hierarchy", "tree", "postgres", "closure-tree"]
+categories = ["database", "data-structures"]
+
+[dependencies]
+sea-orm = { version = "1.1", default-features = false, features = [
+    "macros",
+    "runtime-tokio-rustls",
+    "sqlx-postgres",
+    "mock",
+] }
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio-rustls",
+    "postgres",
+] }
+async-trait = "0.1"
+thiserror = "2"
+once_cell = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crc32fast = "1"
+closure-tree-macros = { version = "0.0.1", path = "closure-tree-macros" }
+
+[dev-dependencies]
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros"] }
+
+[patch.crates-io]
+closure-tree-macros = { path = "closure-tree-macros" }
