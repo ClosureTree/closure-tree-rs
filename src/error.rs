@@ -17,6 +17,15 @@ pub enum ClosureTreeError {
 
     #[error("closure-tree invariant violation: {0}")]
     Invariant(String),
+
+    #[error("cycle detected in batch parent references at index {0}")]
+    CycleDetected(usize),
+
+    #[error("parent not found: {0}")]
+    ParentNotFound(String),
+
+    #[error("invalid batch index: {0}")]
+    InvalidBatchIndex(usize),
 }
 
 impl ClosureTreeError {

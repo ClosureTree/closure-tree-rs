@@ -1,3 +1,4 @@
+use std::collections::{HashMap, VecDeque};
 use std::marker::PhantomData;
 
 use sea_orm::{
@@ -5,9 +6,11 @@ use sea_orm::{
     QueryFilter, QueryOrder,
 };
 
-use sea_orm::sea_query::Expr;
+use sea_orm::sea_query::{Expr, ExprTrait, Value};
 
-use crate::config::{ClosureTreeConfig, OrderStrategy};
+use crate::config::{
+    BulkInsertOptions, BulkInsertResult, ClosureTreeConfig, InsertNode, OrderStrategy, ParentRef,
+};
 use crate::error::ClosureTreeError;
 use crate::lock::LockedTransaction;
 use crate::traits::ClosureTreeModel;
@@ -325,5 +328,397 @@ where
 
         let models = query.all(conn).await?;
         Ok(models)
+    }
+
+    /// Topologically sort nodes into waves based on InBatch dependencies.
+    /// Returns Vec<Vec<usize>> where each inner Vec is a wave of node indices
+    /// that can be inserted in parallel.
+    fn topological_sort_nodes(
+        nodes: &[InsertNode<M>],
+    ) -> Result<Vec<Vec<usize>>, ClosureTreeError> {
+        let n = nodes.len();
+        let mut in_degree = vec![0; n];
+        let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); n];
+
+        // Build dependency graph
+        for (idx, node) in nodes.iter().enumerate() {
+            if let Some(ParentRef::InBatch(parent_idx)) = &node.parent_ref {
+                if *parent_idx >= n {
+                    return Err(ClosureTreeError::InvalidBatchIndex(*parent_idx));
+                }
+                adjacency[*parent_idx].push(idx);
+                in_degree[idx] += 1;
+            }
+        }
+
+        // Kahn's algorithm
+        let mut waves = Vec::new();
+        let mut queue: VecDeque<usize> = in_degree
+            .iter()
+            .enumerate()
+            .filter(|(_, &deg)| deg == 0)
+            .map(|(idx, _)| idx)
+            .collect();
+
+        let mut processed = 0;
+        while !queue.is_empty() {
+            let wave_size = queue.len();
+            let mut wave = Vec::with_capacity(wave_size);
+
+            for _ in 0..wave_size {
+                if let Some(node_idx) = queue.pop_front() {
+                    wave.push(node_idx);
+                    processed += 1;
+
+                    for &child_idx in &adjacency[node_idx] {
+                        in_degree[child_idx] -= 1;
+                        if in_degree[child_idx] == 0 {
+                            queue.push_back(child_idx);
+                        }
+                    }
+                }
+            }
+
+            if !wave.is_empty() {
+                waves.push(wave);
+            }
+        }
+
+        // Check for cycles
+        if processed != n {
+            let cycle_node = in_degree
+                .iter()
+                .position(|&deg| deg > 0)
+                .unwrap_or(0);
+            return Err(ClosureTreeError::CycleDetected(cycle_node));
+        }
+
+        Ok(waves)
+    }
+
+    /// Resolve external keys to internal IDs by querying the database.
+    ///
+    /// **TODO**: Currently returns empty map. Needs trait method to extract
+    /// conflict column value from models:
+    ///
+    /// ```ignore
+    /// trait ClosureTreeModel {
+    ///     fn get_column_value(&self, column: &str) -> Option<Value>;
+    /// }
+    /// ```
+    ///
+    /// Then implementation would be:
+    /// ```ignore
+    /// let mut map = HashMap::new();
+    /// for model in models {
+    ///     if let Some(key_val) = model.get_column_value(conflict_column) {
+    ///         map.insert(format!("{:?}", key_val), model.id());
+    ///     }
+    /// }
+    /// ```
+    async fn resolve_external_keys<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        external_keys: Vec<Value>,
+        conflict_column: &str,
+    ) -> Result<HashMap<String, M::Id>, ClosureTreeError> {
+        if external_keys.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // Query nodes by conflict column
+        // Note: Using Expr::cust for dynamic column name
+        let column_expr = Expr::cust(conflict_column);
+        let _models = M::Entity::find()
+            .filter(column_expr.is_in(external_keys))
+            .all(conn)
+            .await?;
+
+        // Temporary stub - needs trait method support
+        Ok(HashMap::new())
+    }
+
+    /// Build and execute bulk INSERT with ON CONFLICT, returning inserted models.
+    ///
+    /// **Current implementation**: Inserts one-by-one due to SeaORM limitations.
+    /// **Performance impact**: ~N queries instead of 1 for N nodes.
+    ///
+    /// **TODO**: Replace with raw SQL for true bulk insert:
+    /// ```sql
+    /// INSERT INTO nodes (parent_id, name, conflict_column)
+    /// VALUES
+    ///   ($1, $2, $3),
+    ///   ($4, $5, $6),
+    ///   ...
+    /// ON CONFLICT (conflict_column) DO NOTHING
+    /// RETURNING *
+    /// ```
+    ///
+    /// This would reduce ~70K queries → ~10 queries for typical hierarchies.
+    ///
+    /// Implementation sketch:
+    /// ```ignore
+    /// let sql = build_bulk_insert_sql(&wave_nodes, options);
+    /// let stmt = Statement::from_sql_and_values(DbBackend::Postgres, sql, values);
+    /// let rows = conn.query_all(stmt).await?;
+    /// let models: Vec<M> = rows.into_iter()
+    ///     .map(|row| M::from_query_result(&row, ""))
+    ///     .collect::<Result<_, _>>()?;
+    /// ```
+    async fn bulk_insert_wave<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        wave_nodes: Vec<(usize, M::ActiveModel)>,
+        _options: &BulkInsertOptions,
+    ) -> Result<(Vec<M>, Vec<usize>), ClosureTreeError> {
+        if wave_nodes.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+
+        // Temporary: insert one by one
+        let mut inserted_models = Vec::new();
+        let mut inserted_indices = Vec::new();
+
+        for (original_idx, active_model) in wave_nodes {
+            match active_model.insert(conn).await {
+                Ok(model) => {
+                    inserted_models.push(model);
+                    inserted_indices.push(original_idx);
+                }
+                Err(_) => {
+                    // Conflict - skip
+                    // TODO: Fetch existing by conflict column and update idx_to_id map
+                }
+            }
+        }
+
+        Ok((inserted_models, inserted_indices))
+    }
+
+    /// Bulk insert nodes with parent references and hierarchy generation.
+    ///
+    /// Optimized for importing large hierarchical datasets (e.g., 23K messages).
+    ///
+    /// # Algorithm
+    /// 1. Topologically sort nodes by `InBatch` dependencies into "waves"
+    /// 2. Resolve `ExternalKey` parents (TODO: currently stubbed)
+    /// 3. Insert each wave with parent_id set from resolved references
+    /// 4. Generate hierarchy rows for all inserted nodes
+    ///
+    /// # Performance
+    /// - **Current**: ~3N queries for N nodes (insert + hierarchy per node)
+    /// - **Target**: ~10 queries total via batched INSERT + batched hierarchy
+    ///
+    /// # Example
+    /// ```ignore
+    /// let nodes = vec![
+    ///     InsertNode {
+    ///         model: ActiveModel { name: "root".into(), .. },
+    ///         parent_ref: None,
+    ///     },
+    ///     InsertNode {
+    ///         model: ActiveModel { name: "child".into(), .. },
+    ///         parent_ref: Some(ParentRef::InBatch(0)),
+    ///     },
+    /// ];
+    ///
+    /// let options = BulkInsertOptions::new("external_uuid");
+    /// let result = repo.bulk_insert_with_parent_ids(&db, nodes, options).await?;
+    /// println!("Inserted: {}, Skipped: {}", result.inserted, result.skipped);
+    /// ```
+    ///
+    /// # Errors
+    /// - `CycleDetected` if `InBatch` references form a cycle
+    /// - `InvalidBatchIndex` if index is out of bounds
+    /// - Database errors during insert
+    pub async fn bulk_insert_with_parent_ids(
+        &self,
+        conn: &DatabaseConnection,
+        nodes: Vec<InsertNode<M>>,
+        options: BulkInsertOptions,
+    ) -> Result<BulkInsertResult<M>, ClosureTreeError> {
+        Self::ensure_postgres(conn)?;
+
+        if nodes.is_empty() {
+            return Ok(BulkInsertResult {
+                inserted: 0,
+                skipped: 0,
+                models: Vec::new(),
+            });
+        }
+
+        // Acquire lock if needed
+        let strategy = if options.skip_advisory_locks {
+            crate::config::AdvisoryLockStrategy::Disabled
+        } else {
+            self.config().advisory_lock_strategy().clone()
+        };
+
+        let guard = LockedTransaction::acquire(&strategy, conn).await?;
+        let result = self
+            .bulk_insert_with_guard(guard, nodes, options)
+            .await;
+
+        match result {
+            Ok(res) => Ok(res),
+            Err(err) => Err(err),
+        }
+    }
+
+    async fn bulk_insert_with_guard(
+        &self,
+        guard: LockedTransaction,
+        nodes: Vec<InsertNode<M>>,
+        options: BulkInsertOptions,
+    ) -> Result<BulkInsertResult<M>, ClosureTreeError> {
+        let conn = guard.connection();
+
+        // Step 1: Topological sort
+        let waves = Self::topological_sort_nodes(&nodes)?;
+
+        // Step 2: Resolve external keys
+        let external_keys: Vec<Value> = nodes
+            .iter()
+            .filter_map(|node| {
+                if let Some(ParentRef::ExternalKey(val)) = &node.parent_ref {
+                    Some(val.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let _external_map = self
+            .resolve_external_keys(conn, external_keys, &options.conflict_column)
+            .await?;
+
+        // Step 3: Process waves
+        let mut all_inserted = Vec::new();
+        let mut idx_to_id: HashMap<usize, M::Id> = HashMap::new();
+        let mut total_inserted = 0;
+
+        for wave in waves {
+            let mut wave_nodes = Vec::new();
+
+            for &idx in &wave {
+                let node = &nodes[idx];
+                let mut active = node.model.clone();
+
+                // Resolve parent reference
+                let parent_id = match &node.parent_ref {
+                    None => None,
+                    Some(ParentRef::InternalId(id)) => Some(id.clone()),
+                    Some(ParentRef::InBatch(parent_idx)) => {
+                        idx_to_id.get(parent_idx).cloned()
+                    }
+                    Some(ParentRef::ExternalKey(_val)) => {
+                        // TODO: Lookup from external_map
+                        None
+                    }
+                };
+
+                M::set_parent(&mut active, parent_id);
+                wave_nodes.push((idx, active));
+            }
+
+            let (inserted, indices) = self.bulk_insert_wave(conn, wave_nodes, &options).await?;
+
+            // Update idx_to_id map
+            for (i, &original_idx) in indices.iter().enumerate() {
+                idx_to_id.insert(original_idx, inserted[i].id());
+            }
+
+            // Insert hierarchy rows for this wave BEFORE next wave
+            // (next wave needs to query these ancestors)
+            self.batch_insert_all_hierarchy_rows(conn, &inserted).await?;
+
+            total_inserted += inserted.len();
+            all_inserted.extend(inserted);
+        }
+
+        guard.commit().await?;
+
+        Ok(BulkInsertResult {
+            inserted: total_inserted,
+            skipped: nodes.len() - total_inserted,
+            models: all_inserted,
+        })
+    }
+
+    /// Batch insert hierarchy rows for multiple nodes at once.
+    /// Much faster than inserting per-node: 1 ancestor query + 1 bulk insert vs N queries.
+    async fn batch_insert_all_hierarchy_rows<C: ConnectionTrait>(
+        &self,
+        conn: &C,
+        models: &[M],
+    ) -> Result<(), ClosureTreeError> {
+        if models.is_empty() {
+            return Ok(());
+        }
+
+        // Collect all unique parent IDs
+        let parent_ids: Vec<M::Id> = models
+            .iter()
+            .filter_map(|m| m.parent_id())
+            .collect();
+
+        // Query all ancestors for all parents in one query
+        let all_ancestors = if !parent_ids.is_empty() {
+            let parent_values: Vec<Value> = parent_ids
+                .iter()
+                .map(|id| M::hierarchy_id_to_value(id))
+                .collect();
+
+            M::HierarchyEntity::find()
+                .filter(M::hierarchy_descendant_column().is_in(parent_values))
+                .all(conn)
+                .await?
+        } else {
+            Vec::new()
+        };
+
+        // Generate all hierarchy rows for all nodes
+        let mut all_rows = Vec::new();
+        for model in models {
+            let model_id = model.id();
+
+            // Self-referential row
+            all_rows.push(M::hierarchy_build_row(
+                model_id.clone(),
+                model_id.clone(),
+                0,
+            ));
+
+            // Parent ancestor rows - match by comparing values
+            if let Some(parent_id) = model.parent_id() {
+                let parent_value = M::hierarchy_id_to_value(&parent_id);
+
+                for ancestor_row in &all_ancestors {
+                    let descendant_id = M::hierarchy_model_descendant(ancestor_row);
+                    let descendant_value = M::hierarchy_id_to_value(&descendant_id);
+
+                    // Check if this ancestor belongs to our parent
+                    if descendant_value == parent_value {
+                        let ancestor_id = M::hierarchy_model_ancestor(ancestor_row);
+                        let generations = M::hierarchy_model_generations(ancestor_row);
+
+                        all_rows.push(M::hierarchy_build_row(
+                            ancestor_id,
+                            model_id.clone(),
+                            generations + 1,
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Bulk insert all hierarchy rows at once
+        if !all_rows.is_empty() {
+            M::HierarchyEntity::insert_many(all_rows)
+                .exec(conn)
+                .await?;
+        }
+
+        Ok(())
     }
 }

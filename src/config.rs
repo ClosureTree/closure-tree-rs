@@ -1,4 +1,6 @@
+use crate::traits::ClosureTreeModel;
 use crc32fast::Hasher;
+use sea_orm::sea_query::Value;
 
 /// Static configuration describing how a SeaORM model integrates with
 /// the closure-table hierarchy.
@@ -149,18 +151,13 @@ impl ClosureTreeOptions {
 }
 
 /// Behaviour to apply to dependent nodes when destroying a record.
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, Default)]
 pub enum DependentBehavior {
+    #[default]
     Nullify,
     Destroy,
     DeleteAll,
     None,
-}
-
-impl Default for DependentBehavior {
-    fn default() -> Self {
-        Self::Nullify
-    }
 }
 
 /// Strategy used to generate deterministic ordering.
@@ -215,4 +212,119 @@ impl AdvisoryLockStrategy {
             AdvisoryLockStrategy::Namespaced(key) => Some(key),
         }
     }
+}
+
+/// A node to insert with bulk operations, including parent reference information.
+///
+/// Used with `ClosureTreeRepository::bulk_insert_with_parent_ids` to perform
+/// batched inserts of hierarchical data.
+#[derive(Clone)]
+pub struct InsertNode<M: ClosureTreeModel> {
+    /// The node's active model ready for insertion
+    pub model: M::ActiveModel,
+    /// How to resolve this node's parent (if any)
+    pub parent_ref: Option<ParentRef<M>>,
+}
+
+/// Reference to a parent node during bulk insertion.
+///
+/// Allows flexible parent resolution across three strategies:
+/// - Already-inserted parents via ID lookup
+/// - Parents to be looked up by conflict column (TODO: needs trait support)
+/// - Parents within the same batch (topologically sorted)
+#[derive(Clone)]
+pub enum ParentRef<M: ClosureTreeModel> {
+    /// Parent already exists in database with this ID.
+    /// No additional lookup required.
+    InternalId(M::Id),
+
+    /// Lookup parent by conflict column value (e.g., external_uuid).
+    ///
+    /// **TODO**: Currently stubbed. Requires adding trait method to extract
+    /// arbitrary column values from models for lookup:
+    /// ```ignore
+    /// fn get_column_value(&self, column: &str) -> Option<Value>;
+    /// ```
+    ExternalKey(Value),
+
+    /// Parent is at this index in the current batch.
+    /// Nodes are topologically sorted to ensure parents are inserted first.
+    /// Index is 0-based position in the original `nodes` Vec.
+    InBatch(usize),
+}
+
+/// Options for bulk insert operations.
+///
+/// Controls conflict resolution and locking behavior during bulk inserts.
+///
+/// # Example
+/// ```ignore
+/// let options = BulkInsertOptions::new("external_uuid")
+///     .with_strategy(ConflictStrategy::Skip)
+///     .without_locks();
+/// ```
+#[derive(Clone, Debug)]
+pub struct BulkInsertOptions {
+    /// Column name used for conflict detection (e.g., "external_uuid")
+    pub conflict_column: String,
+    /// How to handle conflicts when they occur
+    pub conflict_strategy: ConflictStrategy,
+    /// Skip advisory locks (use with caution in controlled imports)
+    pub skip_advisory_locks: bool,
+}
+
+impl BulkInsertOptions {
+    /// Create new bulk insert options with a conflict column.
+    pub fn new(conflict_column: impl Into<String>) -> Self {
+        Self {
+            conflict_column: conflict_column.into(),
+            conflict_strategy: ConflictStrategy::Skip,
+            skip_advisory_locks: false,
+        }
+    }
+
+    /// Set the conflict strategy.
+    pub fn with_strategy(mut self, strategy: ConflictStrategy) -> Self {
+        self.conflict_strategy = strategy;
+        self
+    }
+
+    /// Skip advisory locks (use with caution).
+    pub fn without_locks(mut self) -> Self {
+        self.skip_advisory_locks = true;
+        self
+    }
+}
+
+/// Strategy for handling conflicts during bulk insert.
+///
+/// **TODO**: Currently only `Skip` is implemented. `Update` requires raw SQL
+/// generation for `ON CONFLICT DO UPDATE SET` clauses.
+#[derive(Clone, Debug)]
+pub enum ConflictStrategy {
+    /// ON CONFLICT DO NOTHING - skip conflicting rows
+    Skip,
+
+    /// ON CONFLICT DO UPDATE SET columns (not yet implemented)
+    ///
+    /// **TODO**: Requires raw SQL builder to generate:
+    /// ```sql
+    /// ON CONFLICT (conflict_column) DO UPDATE SET
+    ///   col1 = EXCLUDED.col1,
+    ///   col2 = EXCLUDED.col2
+    /// ```
+    Update(Vec<String>),
+}
+
+/// Result of a bulk insert operation.
+///
+/// Returns counts and only the newly inserted models (not skipped ones).
+#[derive(Clone, Debug)]
+pub struct BulkInsertResult<M: ClosureTreeModel> {
+    /// Number of nodes successfully inserted
+    pub inserted: usize,
+    /// Number of nodes skipped due to conflicts
+    pub skipped: usize,
+    /// Only newly inserted models (excludes skipped/existing ones)
+    pub models: Vec<M>,
 }

@@ -14,8 +14,9 @@ pub mod traits;
 pub mod prelude {
     //! Convenient re-exports for consumers.
     pub use crate::config::{
-        AdvisoryLockStrategy, ClosureTreeConfig, ClosureTreeOptions, DependentBehavior,
-        OrderStrategy,
+        AdvisoryLockStrategy, BulkInsertOptions, BulkInsertResult, ClosureTreeConfig,
+        ClosureTreeOptions, ConflictStrategy, DependentBehavior, InsertNode, OrderStrategy,
+        ParentRef,
     };
     pub use crate::traits::ClosureTreeModel;
 }
@@ -24,8 +25,9 @@ pub use closure_tree_macros::ClosureTreeModel as ClosureTreeModelDerive;
 #[doc(hidden)]
 pub use closure_tree_macros::ClosureTreeModel;
 pub use config::{
-    AdvisoryLockKey, AdvisoryLockStrategy, ClosureTreeConfig, ClosureTreeOptions,
-    DependentBehavior, OrderStrategy,
+    AdvisoryLockKey, AdvisoryLockStrategy, BulkInsertOptions, BulkInsertResult,
+    ClosureTreeConfig, ClosureTreeOptions, ConflictStrategy, DependentBehavior, InsertNode,
+    OrderStrategy, ParentRef,
 };
 pub use error::ClosureTreeError;
 pub use repository::ClosureTreeRepository;
