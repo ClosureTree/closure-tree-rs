@@ -101,7 +101,7 @@ async fn truncate_tables(db: &DatabaseConnection) -> Result<(), sea_orm::DbErr> 
         CREATE TABLE nodes (
             id SERIAL PRIMARY KEY,
             parent_id INTEGER REFERENCES nodes(id) ON DELETE CASCADE,
-            name TEXT NOT NULL
+            name TEXT NOT NULL UNIQUE
         );
         "#,
     ))

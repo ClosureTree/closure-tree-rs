@@ -3,7 +3,7 @@ use std::marker::PhantomData;
 
 use sea_orm::{
     entity::prelude::*, ColumnTrait, Condition, ConnectionTrait, DbBackend, EntityTrait,
-    QueryFilter, QueryOrder,
+    QueryFilter, QueryOrder, Statement,
 };
 
 use sea_orm::sea_query::{Expr, ExprTrait, Value};
@@ -440,55 +440,79 @@ where
 
     /// Build and execute bulk INSERT with ON CONFLICT, returning inserted models.
     ///
-    /// **Current implementation**: Inserts one-by-one due to SeaORM limitations.
-    /// **Performance impact**: ~N queries instead of 1 for N nodes.
-    ///
-    /// **TODO**: Replace with raw SQL for true bulk insert:
-    /// ```sql
-    /// INSERT INTO nodes (parent_id, name, conflict_column)
-    /// VALUES
-    ///   ($1, $2, $3),
-    ///   ($4, $5, $6),
-    ///   ...
-    /// ON CONFLICT (conflict_column) DO NOTHING
-    /// RETURNING *
-    /// ```
-    ///
-    /// This would reduce ~70K queries → ~10 queries for typical hierarchies.
-    ///
-    /// Implementation sketch:
-    /// ```ignore
-    /// let sql = build_bulk_insert_sql(&wave_nodes, options);
-    /// let stmt = Statement::from_sql_and_values(DbBackend::Postgres, sql, values);
-    /// let rows = conn.query_all(stmt).await?;
-    /// let models: Vec<M> = rows.into_iter()
-    ///     .map(|row| M::from_query_result(&row, ""))
-    ///     .collect::<Result<_, _>>()?;
-    /// ```
+    /// Uses raw SQL for true bulk insert with batched VALUES and RETURNING.
     async fn bulk_insert_wave<C: ConnectionTrait>(
         &self,
         conn: &C,
-        wave_nodes: Vec<(usize, M::ActiveModel)>,
-        _options: &BulkInsertOptions,
+        wave_nodes: Vec<(usize, Option<M::Id>, String)>, // (idx, parent_id, name)
+        options: &BulkInsertOptions,
     ) -> Result<(Vec<M>, Vec<usize>), ClosureTreeError> {
         if wave_nodes.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
 
-        // Temporary: insert one by one
+        let config = self.config();
+        let table_name = M::Entity::default().table_name().to_string();
+
+        // Build VALUES placeholders and collect parameter values
+        let mut values = Vec::new();
+        let mut placeholders = Vec::new();
+        let mut original_indices = Vec::new();
+
+        for (idx, (original_idx, parent_id, name)) in wave_nodes.iter().enumerate() {
+            let parent_val = match parent_id {
+                Some(id) => M::id_to_value(id),
+                None => Value::Int(None),
+            };
+            let name_val = Value::String(Some(Box::new(name.clone())));
+
+            let param_offset = idx * 2 + 1;
+            placeholders.push(format!("(${}, ${})", param_offset, param_offset + 1));
+            values.push(parent_val);
+            values.push(name_val);
+            original_indices.push(*original_idx);
+        }
+
+        // Build ON CONFLICT clause
+        let conflict_clause = match &options.conflict_strategy {
+            crate::config::ConflictStrategy::Skip => {
+                format!("ON CONFLICT ({}) DO NOTHING", options.conflict_column)
+            }
+            crate::config::ConflictStrategy::Update(cols) => {
+                let updates = cols
+                    .iter()
+                    .map(|col| format!("{} = EXCLUDED.{}", col, col))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "ON CONFLICT ({}) DO UPDATE SET {}",
+                    options.conflict_column, updates
+                )
+            }
+        };
+
+        // Build full SQL statement
+        let sql = format!(
+            "INSERT INTO {} ({}, {}) VALUES {} {} RETURNING *",
+            table_name,
+            config.parent_column(),
+            config.name_column(),
+            placeholders.join(", "),
+            conflict_clause
+        );
+
+        // Execute and deserialize
+        let stmt = Statement::from_sql_and_values(DbBackend::Postgres, &sql, values);
+        let query_results = conn.query_all(stmt).await?;
+
         let mut inserted_models = Vec::new();
         let mut inserted_indices = Vec::new();
 
-        for (original_idx, active_model) in wave_nodes {
-            match active_model.insert(conn).await {
-                Ok(model) => {
-                    inserted_models.push(model);
-                    inserted_indices.push(original_idx);
-                }
-                Err(_) => {
-                    // Conflict - skip
-                    // TODO: Fetch existing by conflict column and update idx_to_id map
-                }
+        for (i, row) in query_results.iter().enumerate() {
+            let model = M::from_query_result(row, "")?;
+            inserted_models.push(model);
+            if i < original_indices.len() {
+                inserted_indices.push(original_indices[i]);
             }
         }
 
@@ -602,7 +626,7 @@ where
 
             for &idx in &wave {
                 let node = &nodes[idx];
-                let mut active = node.model.clone();
+                let active = node.model.clone();
 
                 // Resolve parent reference
                 let parent_id = match &node.parent_ref {
@@ -617,8 +641,12 @@ where
                     }
                 };
 
-                M::set_parent(&mut active, parent_id);
-                wave_nodes.push((idx, active));
+                // Extract name from ActiveModel
+                let name = M::get_name_from_active(&active).ok_or_else(|| {
+                    ClosureTreeError::invariant("name field must be set for bulk insert")
+                })?;
+
+                wave_nodes.push((idx, parent_id, name));
             }
 
             let (inserted, indices) = self.bulk_insert_wave(conn, wave_nodes, &options).await?;

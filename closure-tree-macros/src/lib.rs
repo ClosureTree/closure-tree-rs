@@ -187,6 +187,14 @@ fn impl_closure_tree_model(input: &DeriveInput) -> syn::Result<TokenStream> {
                 active.#name_field_ident = ::sea_orm::ActiveValue::Set(name.to_owned());
             }
 
+            fn get_name_from_active(active: &Self::ActiveModel) -> Option<String> {
+                match &active.#name_field_ident {
+                    ::sea_orm::ActiveValue::Set(val) => Some(val.clone()),
+                    ::sea_orm::ActiveValue::Unchanged(val) => Some(val.clone()),
+                    ::sea_orm::ActiveValue::NotSet => None,
+                }
+            }
+
             fn parent_column() -> <Self::Entity as ::sea_orm::EntityTrait>::Column {
                 Column::#parent_column_variant
             }

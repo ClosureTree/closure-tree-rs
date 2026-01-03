@@ -29,6 +29,7 @@ pub trait ClosureTreeModel:
 
     fn name(&self) -> &str;
     fn set_name(active: &mut Self::ActiveModel, name: &str);
+    fn get_name_from_active(active: &Self::ActiveModel) -> Option<String>;
 
     fn parent_column() -> <Self::Entity as EntityTrait>::Column;
     fn id_column() -> <Self::Entity as EntityTrait>::Column;
