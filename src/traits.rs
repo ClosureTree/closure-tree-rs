@@ -1,5 +1,6 @@
 use sea_orm::{
-    ActiveModelBehavior, ActiveModelTrait, EntityTrait, FromQueryResult, IntoActiveModel, Value,
+    sea_query::ArrayType, ActiveModelBehavior, ActiveModelTrait, EntityTrait, FromQueryResult,
+    IntoActiveModel, Value,
 };
 
 use crate::config::ClosureTreeConfig;
@@ -26,6 +27,13 @@ pub trait ClosureTreeModel:
     fn parent_id(&self) -> Option<Self::Id>;
     fn set_parent(active: &mut Self::ActiveModel, parent: Option<Self::Id>);
     fn id_to_value(id: &Self::Id) -> Value;
+
+    /// Sentinel value for NULL IDs in UNNEST operations.
+    /// For Int: -1, for UUID: 00000000-0000-0000-0000-000000000000, etc.
+    fn null_id_sentinel() -> Value;
+
+    /// Array type for PostgreSQL UNNEST operations.
+    fn id_array_type() -> ArrayType;
 
     fn name(&self) -> &str;
     fn set_name(active: &mut Self::ActiveModel, name: &str);

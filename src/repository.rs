@@ -460,14 +460,12 @@ where
         let mut names: Vec<String> = Vec::new();
         let mut original_indices = Vec::new();
 
-        // Sentinel value for NULL parent_ids (-1)
+        // Use type-specific sentinel for NULL parent_ids
         // Will convert back to NULL using NULLIF in SQL
-        const NULL_SENTINEL: i32 = -1;
-
         for (original_idx, parent_id, name) in wave_nodes.iter() {
             let parent_val = match parent_id {
                 Some(id) => M::id_to_value(id),
-                None => Value::Int(Some(NULL_SENTINEL)),
+                None => M::null_id_sentinel(),
             };
             parent_ids.push(parent_val);
             names.push(name.clone());
@@ -476,7 +474,7 @@ where
 
         // Build UNNEST arrays as parameters
         use sea_orm::sea_query::ArrayType;
-        let parent_array = Value::Array(ArrayType::Int, Some(Box::new(parent_ids)));
+        let parent_array = Value::Array(M::id_array_type(), Some(Box::new(parent_ids)));
         let name_array = Value::Array(
             ArrayType::String,
             Some(Box::new(
@@ -504,16 +502,26 @@ where
 
         // Build UNNEST SQL - PostgreSQL 18+ array-based bulk insert
         // Advantages: 2 params instead of 2N, 2-5x faster, no param limits
-        // NULLIF converts sentinel -1 back to NULL for parent_id
+        // NULLIF converts type-specific sentinel back to NULL for parent_id
+        let sentinel_nullif = match M::null_id_sentinel() {
+            Value::Int(Some(v)) => format!("NULLIF(parent_id, {})", v),
+            Value::BigInt(Some(v)) => format!("NULLIF(parent_id, {})", v),
+            Value::Uuid(Some(uuid)) => {
+                format!("NULLIF(parent_id, '{}'::uuid)", uuid)
+            }
+            _ => "parent_id".to_string(), // fallback
+        };
+
         let sql = format!(
             r#"INSERT INTO {} ({}, {})
-               SELECT NULLIF(parent_id, -1), name
+               SELECT {}, name
                FROM UNNEST($1, $2) AS t(parent_id, name)
                {}
                RETURNING *"#,
             table_name,
             config.parent_column(),
             config.name_column(),
+            sentinel_nullif,
             conflict_clause
         );
 

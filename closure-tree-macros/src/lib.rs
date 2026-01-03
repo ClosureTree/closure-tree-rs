@@ -179,6 +179,30 @@ fn impl_closure_tree_model(input: &DeriveInput) -> syn::Result<TokenStream> {
                 ::sea_orm::Value::from(id.clone())
             }
 
+            fn null_id_sentinel() -> ::sea_orm::Value {
+                // Type-specific sentinel values for NULL in UNNEST
+                // Int types: -1, UUID: nil UUID, etc.
+                match stringify!(#id_type) {
+                    "Uuid" | "uuid::Uuid" => {
+                        // nil UUID: 00000000-0000-0000-0000-000000000000
+                        ::sea_orm::Value::Uuid(Some(Box::new(
+                            ::uuid::Uuid::nil()
+                        )))
+                    }
+                    "i64" => ::sea_orm::Value::BigInt(Some(-1)),
+                    "i32" | _ => ::sea_orm::Value::Int(Some(-1)),
+                }
+            }
+
+            fn id_array_type() -> ::sea_orm::sea_query::ArrayType {
+                // Type-specific ArrayType for UNNEST
+                match stringify!(#id_type) {
+                    "Uuid" | "uuid::Uuid" => ::sea_orm::sea_query::ArrayType::Bytes,
+                    "i64" => ::sea_orm::sea_query::ArrayType::BigInt,
+                    "i32" | _ => ::sea_orm::sea_query::ArrayType::Int,
+                }
+            }
+
             fn name(&self) -> &str {
                 self.#name_field_ident.as_str()
             }

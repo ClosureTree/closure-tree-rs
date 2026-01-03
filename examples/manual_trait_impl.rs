@@ -90,6 +90,20 @@ impl ClosureTreeModel for Model {
         Value::from(*id)
     }
 
+    fn null_id_sentinel() -> Value {
+        // For i32: use -1
+        // For i64: use Value::BigInt(Some(-1))
+        // For Uuid: use Value::Uuid(Some(Box::new(Uuid::nil())))
+        Value::Int(Some(-1))
+    }
+
+    fn id_array_type() -> sea_orm::sea_query::ArrayType {
+        // For i32: Int
+        // For i64: BigInt
+        // For Uuid: Bytes
+        sea_orm::sea_query::ArrayType::Int
+    }
+
     fn name(&self) -> &str {
         self.name.as_str()
     }
