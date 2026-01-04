@@ -444,43 +444,45 @@ where
     async fn bulk_insert_wave<C: ConnectionTrait>(
         &self,
         conn: &C,
-        wave_nodes: Vec<(usize, Option<M::Id>, String)>, // (idx, parent_id, name)
+        wave_nodes: Vec<(usize, M::ActiveModel)>, // (idx, active_model with ALL columns)
         options: &BulkInsertOptions,
     ) -> Result<(Vec<M>, Vec<usize>), ClosureTreeError> {
         if wave_nodes.is_empty() {
             return Ok((Vec::new(), Vec::new()));
         }
 
-        let config = self.config();
         let table_name = M::Entity::default().table_name().to_string();
 
-        // Collect arrays for UNNEST (PostgreSQL 18+ optimization)
-        // Instead of 2N params, we use 2 array params for any size batch
-        let mut parent_ids: Vec<Value> = Vec::new();
-        let mut names: Vec<String> = Vec::new();
+        // Get column definitions (names and array types)
+        let columns = M::bulk_insert_columns();
+        let column_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
+        let column_count = columns.len();
+
+        // Build column-wise arrays for UNNEST (transpose row data to column data)
+        let mut column_arrays: Vec<Vec<Value>> = vec![Vec::new(); column_count];
         let mut original_indices = Vec::new();
 
-        // Use type-specific sentinel for NULL parent_ids
-        // Will convert back to NULL using NULLIF in SQL
-        for (original_idx, parent_id, name) in wave_nodes.iter() {
-            let parent_val = match parent_id {
-                Some(id) => M::id_to_value(id),
-                None => M::null_id_sentinel(),
-            };
-            parent_ids.push(parent_val);
-            names.push(name.clone());
+        for (original_idx, active) in wave_nodes.iter() {
+            // Extract all column values for this row
+            let row_values = M::extract_bulk_values(active);
+
+            // Append each value to its respective column array
+            for (col_idx, value) in row_values.into_iter().enumerate() {
+                if col_idx < column_count {
+                    column_arrays[col_idx].push(value);
+                }
+            }
             original_indices.push(*original_idx);
         }
 
-        // Build UNNEST arrays as parameters
-        use sea_orm::sea_query::ArrayType;
-        let parent_array = Value::Array(M::id_array_type(), Some(Box::new(parent_ids)));
-        let name_array = Value::Array(
-            ArrayType::String,
-            Some(Box::new(
-                names.into_iter().map(|s| Value::String(Some(Box::new(s)))).collect()
-            ))
-        );
+        // Build UNNEST array parameters
+        let array_params: Vec<Value> = column_arrays
+            .into_iter()
+            .zip(columns.iter())
+            .map(|(values, col_def)| {
+                Value::Array(col_def.array_type.clone(), Some(Box::new(values)))
+            })
+            .collect();
 
         // Build ON CONFLICT clause
         let conflict_clause = match &options.conflict_strategy {
@@ -500,34 +502,24 @@ where
             }
         };
 
-        // Build UNNEST SQL - PostgreSQL 18+ array-based bulk insert
-        // Advantages: 2 params instead of 2N, 2-5x faster, no param limits
-        // NULLIF converts type-specific sentinel back to NULL for parent_id
-        let sentinel_nullif = match M::null_id_sentinel() {
-            Value::Int(Some(v)) => format!("NULLIF(parent_id, {})", v),
-            Value::BigInt(Some(v)) => format!("NULLIF(parent_id, {})", v),
-            Value::Uuid(Some(uuid)) => {
-                format!("NULLIF(parent_id, '{}'::uuid)", uuid)
-            }
-            _ => "parent_id".to_string(), // fallback
-        };
+        // Build UNNEST SQL with all columns
+        let placeholders: Vec<String> = (1..=column_count).map(|i| format!("${}", i)).collect();
+        let unnest_cols = column_names.join(", ");
 
         let sql = format!(
-            r#"INSERT INTO {} ({}, {})
-               SELECT {}, name
-               FROM UNNEST($1, $2) AS t(parent_id, name)
+            r#"INSERT INTO {} ({})
+               SELECT * FROM UNNEST({}) AS t({})
                {}
                RETURNING *"#,
             table_name,
-            config.parent_column(),
-            config.name_column(),
-            sentinel_nullif,
+            unnest_cols,
+            placeholders.join(", "),
+            unnest_cols,
             conflict_clause
         );
 
         // Execute with array parameters
-        let values = vec![parent_array, name_array];
-        let stmt = Statement::from_sql_and_values(DbBackend::Postgres, &sql, values);
+        let stmt = Statement::from_sql_and_values(DbBackend::Postgres, &sql, array_params);
         let query_results = conn.query_all(stmt).await?;
 
         let mut inserted_models = Vec::new();
@@ -651,9 +643,9 @@ where
 
             for &idx in &wave {
                 let node = &nodes[idx];
-                let active = node.model.clone();
+                let mut active = node.model.clone();
 
-                // Resolve parent reference
+                // Resolve and set parent reference on ActiveModel
                 let parent_id = match &node.parent_ref {
                     None => None,
                     Some(ParentRef::InternalId(id)) => Some(id.clone()),
@@ -666,12 +658,10 @@ where
                     }
                 };
 
-                // Extract name from ActiveModel
-                let name = M::get_name_from_active(&active).ok_or_else(|| {
-                    ClosureTreeError::invariant("name field must be set for bulk insert")
-                })?;
+                // Set parent_id on ActiveModel (will be included in bulk insert)
+                M::set_parent(&mut active, parent_id);
 
-                wave_nodes.push((idx, parent_id, name));
+                wave_nodes.push((idx, active));
             }
 
             let (inserted, indices) = self.bulk_insert_wave(conn, wave_nodes, &options).await?;

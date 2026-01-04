@@ -25,9 +25,9 @@ pub use closure_tree_macros::ClosureTreeModel as ClosureTreeModelDerive;
 #[doc(hidden)]
 pub use closure_tree_macros::ClosureTreeModel;
 pub use config::{
-    AdvisoryLockKey, AdvisoryLockStrategy, BulkInsertOptions, BulkInsertResult,
-    ClosureTreeConfig, ClosureTreeOptions, ConflictStrategy, DependentBehavior, InsertNode,
-    OrderStrategy, ParentRef,
+    AdvisoryLockKey, AdvisoryLockStrategy, BulkInsertColumn, BulkInsertOptions,
+    BulkInsertResult, ClosureTreeConfig, ClosureTreeOptions, ConflictStrategy,
+    DependentBehavior, InsertNode, OrderStrategy, ParentRef,
 };
 pub use error::ClosureTreeError;
 pub use repository::ClosureTreeRepository;

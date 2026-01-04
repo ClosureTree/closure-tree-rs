@@ -3,7 +3,7 @@ use sea_orm::{
     IntoActiveModel, Value,
 };
 
-use crate::config::ClosureTreeConfig;
+use crate::config::{BulkInsertColumn, ClosureTreeConfig};
 
 /// Trait implemented by SeaORM `Model` types that participate in the closure tree.
 ///
@@ -34,6 +34,14 @@ pub trait ClosureTreeModel:
 
     /// Array type for PostgreSQL UNNEST operations.
     fn id_array_type() -> ArrayType;
+
+    /// Column definitions for bulk insert (name, array type, is nullable).
+    /// Used to build UNNEST SQL with all columns.
+    fn bulk_insert_columns() -> Vec<BulkInsertColumn>;
+
+    /// Extract values for all bulk insert columns from ActiveModel.
+    /// Order must match bulk_insert_columns().
+    fn extract_bulk_values(active: &Self::ActiveModel) -> Vec<Value>;
 
     fn name(&self) -> &str;
     fn set_name(active: &mut Self::ActiveModel, name: &str);

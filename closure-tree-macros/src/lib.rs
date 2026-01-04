@@ -81,8 +81,17 @@ fn impl_closure_tree_model(input: &DeriveInput) -> syn::Result<TokenStream> {
     let generations_field_ident = Ident::new(&generations_field_name, struct_ident.span());
 
     let mut id_field_type: Option<Type> = options.id_type.clone();
+    let mut bulk_insert_fields = Vec::new();
 
     if let Fields::Named(ref fields) = data_struct.fields {
+        for field in &fields.named {
+            if let Some(ident) = &field.ident {
+                // Skip id field (auto-generated in DB)
+                if ident != &id_field_ident {
+                    bulk_insert_fields.push((ident.clone(), field.ty.clone()));
+                }
+            }
+        }
         for field in &fields.named {
             if let Some(ident) = &field.ident {
                 if ident == &id_field_ident && id_field_type.is_none() {
@@ -131,6 +140,11 @@ fn impl_closure_tree_model(input: &DeriveInput) -> syn::Result<TokenStream> {
     let descendant_column_variant = format_ident!("{}", to_pascal_case(&descendant_field_name));
     let generations_column_variant = format_ident!("{}", to_pascal_case(&generations_field_name));
 
+    // Split bulk_insert_fields into separate vectors for quote
+    let bulk_field_idents: Vec<_> = bulk_insert_fields.iter().map(|(ident, _)| ident).collect();
+    let bulk_field_types: Vec<_> = bulk_insert_fields.iter().map(|(_, ty)| ty).collect();
+    let bulk_field_names: Vec<String> = bulk_field_idents.iter().map(|i| i.to_string()).collect();
+
     let parent_column_literal = syn::LitStr::new(&parent_field_name, struct_ident.span());
     let name_column_literal = syn::LitStr::new(&name_field_name, struct_ident.span());
     let hierarchy_table_literal = syn::LitStr::new(&hierarchy_table, struct_ident.span());
@@ -138,6 +152,27 @@ fn impl_closure_tree_model(input: &DeriveInput) -> syn::Result<TokenStream> {
     let hierarchy_name_literal = syn::LitStr::new(&hierarchy_name, struct_ident.span());
 
     let generated = quote! {
+        // Helper function to map Rust types to PostgreSQL ArrayType
+        fn type_to_array_type(type_name: &str) -> ::sea_orm::sea_query::ArrayType {
+            if type_name.contains("Uuid") || type_name.contains("uuid") {
+                ::sea_orm::sea_query::ArrayType::Bytes
+            } else if type_name.contains("i64") || type_name.contains("BigInt") {
+                ::sea_orm::sea_query::ArrayType::BigInt
+            } else if type_name.contains("String") || type_name.contains("str") {
+                ::sea_orm::sea_query::ArrayType::String
+            } else if type_name.contains("bool") {
+                ::sea_orm::sea_query::ArrayType::Bool
+            } else if type_name.contains("f64") || type_name.contains("Double") {
+                ::sea_orm::sea_query::ArrayType::Double
+            } else if type_name.contains("f32") || type_name.contains("Float") {
+                ::sea_orm::sea_query::ArrayType::Float
+            } else {
+                // Default to Int for i32 and unknown types
+                ::sea_orm::sea_query::ArrayType::Int
+            }
+        }
+
+
         impl ::closure_tree::ClosureTreeModel for #struct_ident {
             type Entity = Entity;
             type ActiveModel = ActiveModel;
@@ -273,6 +308,50 @@ fn impl_closure_tree_model(input: &DeriveInput) -> syn::Result<TokenStream> {
                         ..::core::default::Default::default()
                     }
                 }
+            }
+
+            fn bulk_insert_columns() -> Vec<::closure_tree::BulkInsertColumn> {
+                // Generate column definitions for all fields except id
+                vec![
+                    #(
+                        ::closure_tree::BulkInsertColumn::new(
+                            #bulk_field_names,
+                            type_to_array_type(stringify!(#bulk_field_types))
+                        )
+                    ),*
+                ]
+            }
+
+            fn extract_bulk_values(active: &Self::ActiveModel) -> Vec<::sea_orm::Value> {
+                // Helper to get sentinel for type (handles Option types)
+                fn type_sentinel(type_name: &str) -> ::sea_orm::Value {
+                    if type_name.contains("Uuid") || type_name.contains("uuid") {
+                        ::sea_orm::Value::Uuid(Some(Box::new(::uuid::Uuid::nil())))
+                    } else if type_name.contains("i64") || type_name.contains("BigInt") {
+                        ::sea_orm::Value::BigInt(Some(-1))
+                    } else if type_name.contains("String") {
+                        ::sea_orm::Value::String(Some(Box::new(String::new())))
+                    } else {
+                        ::sea_orm::Value::Int(Some(-1))
+                    }
+                }
+
+                // Helper to convert value ensuring consistent types in arrays
+                fn to_value<T: Into<::sea_orm::Value> + Clone>(v: &T) -> ::sea_orm::Value {
+                    v.clone().into()
+                }
+
+                vec![
+                    #(
+                        match &active.#bulk_field_idents {
+                            ::sea_orm::ActiveValue::Set(v) => to_value(v),
+                            ::sea_orm::ActiveValue::Unchanged(v) => to_value(v),
+                            ::sea_orm::ActiveValue::NotSet => {
+                                type_sentinel(stringify!(#bulk_field_types))
+                            }
+                        }
+                    ),*
+                ]
             }
         }
     };

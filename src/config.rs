@@ -1,6 +1,6 @@
 use crate::traits::ClosureTreeModel;
 use crc32fast::Hasher;
-use sea_orm::sea_query::Value;
+use sea_orm::sea_query::{ArrayType, Value};
 
 /// Static configuration describing how a SeaORM model integrates with
 /// the closure-table hierarchy.
@@ -314,6 +314,24 @@ pub enum ConflictStrategy {
     ///   col2 = EXCLUDED.col2
     /// ```
     Update(Vec<String>),
+}
+
+/// Column definition for bulk insert UNNEST operations.
+#[derive(Clone, Debug)]
+pub struct BulkInsertColumn {
+    /// Column name in the database
+    pub name: String,
+    /// PostgreSQL array type for UNNEST
+    pub array_type: ArrayType,
+}
+
+impl BulkInsertColumn {
+    pub fn new(name: impl Into<String>, array_type: ArrayType) -> Self {
+        Self {
+            name: name.into(),
+            array_type,
+        }
+    }
 }
 
 /// Result of a bulk insert operation.
